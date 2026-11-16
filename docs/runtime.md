@@ -65,6 +65,11 @@ Use `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>` to keep the tables 
 DRAM, or `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=on llima run <model>` to require
 offloading and fail if the raw files are missing or invalid.
 
+In web mode a chat request that arrives while another one is generating stops it
+(barge-in). With `SIMA_LLIMA_WEB_SINGLE_REQUEST=1` the server instead runs one chat
+request at a time: the new request gets HTTP 503 (`busy`) and the running one is not
+disturbed. `POST /stop` stops the running request and returns when it has ended.
+
 **Examples**
 
 ``` console

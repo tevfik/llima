@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <variant>
 #include <vector>
@@ -35,6 +37,8 @@ WEB::WEB(
     if (_singleton_ptr)
         throw std::runtime_error("Only one WEB instance can be created");
     _singleton_ptr = this;
+    const char* single_request = std::getenv("SIMA_LLIMA_WEB_SINGLE_REQUEST");
+    _barge_in = !(single_request != nullptr && std::string(single_request) == "1");
 
     if (whisper_model_path.has_value()) {
         _whisper_model_ptr = std::make_unique<WhisperModel>(whisper_model_path.value());
@@ -170,8 +174,13 @@ void WEB::_handle_stop(const httplib::Request& req, httplib::Response& res) {
     _set_cors_headers(res);
 
     _stop_and_detach_vlm_thread();
+    // The stopped request's response still has to end before the next request is accepted
+    // (_generating); wait for it so that a request sent right after /stop is not refused.
+    for (int i = 0; i < 200 && _generating.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 
-    // Send response immediately
+    // Send response
     res.status = 200;
     _logger->info("VLM completed.");
 }
@@ -451,12 +460,32 @@ void WEB::_handle_chat_completions(
         }
         Chat chat = std::move(chat_opt.value());
 
-        // 2. Barge-in check
-        _stop_and_detach_vlm_thread();
+        // 2. By default a new request stops a running generation (barge-in), but the old
+        // generation's last tokens and its stop event can then reach the new request's stream
+        // (two clients got each other's answers). With SIMA_LLIMA_WEB_SINGLE_REQUEST=1 a request
+        // that arrives while another runs is refused with 503 instead.
+        std::shared_ptr<void> generation_slot;
+        if (_barge_in) {
+            _stop_and_detach_vlm_thread();
+        } else {
+            if (_generating.exchange(true)) {
+                _logger->warn("Chat request refused: another request is running");
+                res.status = 503;
+                nlohmann::json busy = {{"error", "busy: another request is running"}};
+                if (is_openai) {
+                    busy = {{"error", {{"message", "busy: another request is running"}, {"type", "busy"}}}};
+                }
+                res.set_content(busy.dump(), "application/json");
+                return;
+            }
+            // Released when the last holder goes: here for a normal chat, with the streaming
+            // response's content provider otherwise (after its generation has ended).
+            generation_slot = std::shared_ptr<void>(nullptr, [this](void*) { _generating = false; });
+        }
 
         // 3. Execution
         if (stream) {
-            _execute_streaming_chat(res, chat, model, protocol);
+            _execute_streaming_chat(res, chat, model, protocol, std::move(generation_slot));
         } else {
             _execute_normal_chat(res, chat, model, protocol);
         }
@@ -815,7 +844,8 @@ void WEB::_execute_streaming_chat(
     httplib::Response& res,
     Chat& chat,
     const std::string& model,
-    ChatProtocol protocol
+    ChatProtocol protocol,
+    std::shared_ptr<void> generation_slot
 ) {
     const bool is_openai = protocol == ChatProtocol::OpenAI;
     res.set_header("Content-Type", is_openai ? "text/event-stream" : "application/x-ndjson");
@@ -824,7 +854,7 @@ void WEB::_execute_streaming_chat(
 
     res.set_chunked_content_provider(
         is_openai ? "text/event-stream" : "application/x-ndjson",
-        [this, chat, model, protocol](size_t offset, httplib::DataSink &sink) {
+        [this, chat, model, protocol, generation_slot](size_t offset, httplib::DataSink &sink) {
             (void)offset;
             const bool is_openai = protocol == ChatProtocol::OpenAI;
             const auto created = std::time(nullptr);

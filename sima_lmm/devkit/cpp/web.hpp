@@ -2,6 +2,7 @@
 #ifndef _SIMA_LLIMA_WEB_
 #define _SIMA_LLIMA_WEB_
 
+#include <atomic>
 #include <csignal>
 #include <ctime>
 #include <filesystem>
@@ -109,10 +110,11 @@ class EXPORT WEB {
         );
 
         void _execute_streaming_chat(
-            httplib::Response& res, 
-            Chat& chat, 
-            const std::string& model, 
-            ChatProtocol protocol
+            httplib::Response& res,
+            Chat& chat,
+            const std::string& model,
+            ChatProtocol protocol,
+            std::shared_ptr<void> generation_slot = nullptr
         );
 
         void _execute_normal_chat(
@@ -131,6 +133,11 @@ class EXPORT WEB {
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
         bool _enable_thinking;
         std::jthread _vlm_thread;
+        // Set while a request's generation runs (and until its response ends). With
+        // SIMA_LLIMA_WEB_SINGLE_REQUEST=1 a second request is refused with 503 instead of stopping
+        // the first (barge-in, the default).
+        std::atomic<bool> _generating{false};
+        bool _barge_in = false;
 
         // HTTP server. For HTTPS, use SSLServer and define CPPHTTPLIB_OPENSSL_SUPPORT before
         // including the httplib.h header.
