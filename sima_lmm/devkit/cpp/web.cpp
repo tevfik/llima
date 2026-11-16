@@ -1016,9 +1016,16 @@ void WEB::_execute_streaming_chat(
             _vision_language_model_ptr->set_info_callback(info_callback);
             _vision_language_model_ptr->set_text_callback(text_callback);
 
-            // Create thread and track it for /stop endpoint
-            _vlm_thread = std::jthread([this, chat]() {
-                _vision_language_model_ptr->run_model(chat);
+            // Create thread and track it for /stop endpoint. An exception must not leave the thread
+            // (std::terminate would end the server, e.g. on a chat template that rejects the messages):
+            // the request ends with an error chunk instead.
+            auto generation_error = std::make_shared<std::string>();
+            _vlm_thread = std::jthread([this, chat, generation_error]() {
+                try {
+                    _vision_language_model_ptr->run_model(chat);
+                } catch (const std::exception& e) {
+                    *generation_error = e.what();
+                }
             });
 
             // Wait for completion
@@ -1026,6 +1033,16 @@ void WEB::_execute_streaming_chat(
 
             // No need to reset callbacks - they'll be overwritten on next request
 
+            if (!generation_error->empty()) {
+                _logger->error("Chat request failed: {}", *generation_error);
+                nlohmann::json error_body = is_openai
+                    ? nlohmann::json{{"error", {{"message", *generation_error}, {"type", "invalid_request_error"}}}}
+                    : nlohmann::json{{"error", *generation_error}};
+                const std::string error_chunk = is_openai
+                    ? "data: " + error_body.dump() + "\n\n"
+                    : error_body.dump() + "\n";
+                sink.write(error_chunk.data(), error_chunk.size());
+            }
             sink.done();
             return true;
         }
@@ -1099,11 +1116,27 @@ void WEB::_execute_normal_chat(
     _vision_language_model_ptr->set_info_callback(info_callback);
     _vision_language_model_ptr->set_text_callback(text_callback);
 
-    // Run in thread for consistency with barge-in logic
-    _vlm_thread = std::jthread([this, chat]() {
-        _vision_language_model_ptr->run_model(chat);
+    // Run in thread for consistency with barge-in logic. An exception must not leave the thread
+    // (std::terminate would end the server); it becomes an HTTP 400 below.
+    auto generation_error = std::make_shared<std::string>();
+    _vlm_thread = std::jthread([this, chat, generation_error]() {
+        try {
+            _vision_language_model_ptr->run_model(chat);
+        } catch (const std::exception& e) {
+            *generation_error = e.what();
+        }
     });
     _vlm_thread.join();
+    if (!generation_error->empty()) {
+        _logger->error("Chat request failed: {}", *generation_error);
+        res.status = 400;
+        const bool openai_error = protocol == ChatProtocol::OpenAI;
+        nlohmann::json error_body = openai_error
+            ? nlohmann::json{{"error", {{"message", *generation_error}, {"type", "invalid_request_error"}}}}
+            : nlohmann::json{{"error", *generation_error}};
+        res.set_content(error_body.dump(), "application/json");
+        return;
+    }
 
     // No need to reset callbacks - they'll be overwritten on next request
 
